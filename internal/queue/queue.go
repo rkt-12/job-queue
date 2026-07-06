@@ -127,3 +127,45 @@ func (q *Queue) Dequeue(ctx context.Context, workerName string, visibilityTimeou
 	}
 	return &Claim{Job: j}, nil
 }
+
+// MarkSuccess completes the job, records the idempotency result (if any), and
+// unblocks any jobs whose depends_on points at this one — they simply become
+// eligible for the next Dequeue's EXISTS check, no explicit "wake up" needed.
+func (q *Queue) MarkSuccess(ctx context.Context, job Job, result any) error {
+	body, _ := json.Marshal(result)
+	tx, err := q.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET status='completed', updated_at=now() WHERE id=$1`, job.ID); err != nil {
+		return err
+	}
+	if job.IdempotencyKey != nil {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO idempotency_ledger (idempotency_key, result, completed_at) VALUES ($1,$2,now())
+			ON CONFLICT (idempotency_key) DO NOTHING
+		`, *job.IdempotencyKey, body); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// AlreadyCompleted checks the idempotency ledger BEFORE any side-effecting work runs.
+// Returns (result, true) if found, (nil, false) if not.
+func (q *Queue) AlreadyCompleted(ctx context.Context, idempotencyKey *string) (json.RawMessage, bool, error) {
+	if idempotencyKey == nil || *idempotencyKey == "" {
+		return nil, false, nil
+	}
+	var result json.RawMessage
+	err := q.DB.QueryRowContext(ctx, `SELECT result FROM idempotency_ledger WHERE idempotency_key=$1`, *idempotencyKey).Scan(&result)
+	if err == sql.ErrNoRows {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return result, true, nil
+}
