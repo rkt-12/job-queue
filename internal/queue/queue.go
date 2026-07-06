@@ -7,6 +7,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
+	"math/big"
 	"time"
 )
 
@@ -168,4 +170,114 @@ func (q *Queue) AlreadyCompleted(ctx context.Context, idempotencyKey *string) (j
 		return nil, false, err
 	}
 	return result, true, nil
+}
+
+const baseBackoff = time.Second
+const maxBackoff = 5 * time.Minute
+
+// computebackoff determines how long to wait before retrying a failed job.
+// without this a failing job would be retried again immediately
+func ComputeBackoff(attempts int) time.Duration {
+	exp := float64(baseBackoff) * math.Pow(2, float64(attempts))
+	if exp > float64(maxBackoff) {
+		exp = float64(maxBackoff)
+	}
+	jitterN, _ := rand.Int(rand.Reader, big.NewInt(int64(exp*0.2)+1))
+	return time.Duration(exp) + time.Duration(jitterN.Int64())
+}
+
+type FailOutcome struct {
+	Dead     bool
+	Attempts int
+	Delay    time.Duration
+}
+
+// this  is responsible for handling what happens after a job execution fails.
+// It decides whether the job should be retried or moved to the dead-letter queue.
+// this handles both a genuine handler error AND a reclaimed (crashed-worker)
+// job identically — from the queue's point of view a job that never got acked and a
+// job that explicitly errored are the same event: an attempt that didn't succeed.
+func (q *Queue) MarkFailure(ctx context.Context, job Job, errMsg string) (FailOutcome, error) {
+	attempts := job.Attempts + 1
+	if attempts >= job.MaxAttempts {
+		tx, err := q.DB.BeginTx(ctx, nil)
+		if err != nil {
+			return FailOutcome{}, err
+		}
+		defer tx.Rollback()
+
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO dead_letters (id, job_id, type, queue, payload, attempts, error, failed_at)
+			VALUES ($1,$2,$3,$4,$5,$6,$7, now())
+		`, newID(), job.ID, job.Type, job.Queue, job.Payload, attempts, errMsg); err != nil {
+			return FailOutcome{}, err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE jobs SET status='dead', attempts=$1, last_error=$2, updated_at=now() WHERE id=$3
+		`, attempts, errMsg, job.ID); err != nil {
+			return FailOutcome{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return FailOutcome{}, err
+		}
+		return FailOutcome{Dead: true, Attempts: attempts}, nil
+	}
+
+	delay := ComputeBackoff(attempts)
+	_, err := q.DB.ExecContext(ctx, `
+		UPDATE jobs
+		SET status='pending', attempts=$1, last_error=$2, run_at=now()+$3::interval,
+		    locked_by=NULL, locked_until=NULL, updated_at=now()
+		WHERE id=$4
+	`, attempts, errMsg, fmt.Sprintf("%d milliseconds", delay.Milliseconds()), job.ID)
+	if err != nil {
+		return FailOutcome{}, err
+	}
+	return FailOutcome{Dead: false, Attempts: attempts, Delay: delay}, nil
+}
+
+// this is the crash recovery mechanism. It detects jobs that were claimed by a worker but never completed
+// because the worker crashed, hung, or was killed, and makes sure those jobs don't remain stuck forever
+// any job still "processing" past its locked_until is presumed to belong to a dead worker (it crashed, was
+// killed, or the process hung) and is routed through the exact same
+// retry/backoff/DLQ path as a normal failure. Runs inside a transaction so
+// FOR UPDATE SKIP LOCKED actually holds the lock for the duration of the reap
+// (a bare autocommit SELECT would release it instantly), preventing two reaper
+// runs from double-processing the same stale row.
+func (q *Queue) ReapStale(ctx context.Context) (int, error) {
+	tx, err := q.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT id, type, queue, payload, status, attempts, max_attempts, idempotency_key, depends_on
+		FROM jobs
+		WHERE status='processing' AND locked_until < now()
+		FOR UPDATE SKIP LOCKED
+	`)
+	if err != nil {
+		return 0, err
+	}
+	var stale []Job
+	for rows.Next() {
+		var j Job
+		if err := rows.Scan(&j.ID, &j.Type, &j.Queue, &j.Payload, &j.Status, &j.Attempts, &j.MaxAttempts, &j.IdempotencyKey, &j.DependsOn); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		stale = append(stale, j)
+	}
+	rows.Close()
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+
+	for _, j := range stale {
+		if _, err := q.MarkFailure(ctx, j, "worker died / visibility timeout exceeded"); err != nil {
+			return 0, err
+		}
+	}
+	return len(stale), nil
 }
