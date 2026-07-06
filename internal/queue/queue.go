@@ -82,3 +82,48 @@ func (q *Queue) Enqueue(ctx context.Context, jobType string, payload any, opts E
 	}
 	return id, nil
 }
+
+// Claim is a locked-out job ready for processing, returned by Dequeue.
+type Claim struct{ Job Job }
+
+const priorityOrder = `CASE queue WHEN 'high' THEN 0 WHEN 'default' THEN 1 WHEN 'low' THEN 2 ELSE 3 END`
+
+// Dequeue takes the highest-priority, earliest-due, dependency-satisfied pending job
+// and marks it "processing" with a visibility-timeout lock in the
+// UPDATE ... WHERE id = (SELECT ... FOR UPDATE SKIP LOCKED) statement. SKIP LOCKED is what
+// guarantees two workers can never claim the same row: if worker B's SELECT scans a row
+// worker A's transaction already locked, B just skips it and looks at the next candidate
+// instead of blocking. Returns (nil, nil) if there's nothing to do right now.
+func (q *Queue) Dequeue(ctx context.Context, workerName string, visibilityTimeout time.Duration) (*Claim, error) {
+	row := q.DB.QueryRowContext(ctx, `
+		UPDATE jobs
+		SET status = 'processing',
+		    locked_by = $1,
+		    locked_until = now() + $2::interval,
+		    updated_at = now()
+		WHERE id = (
+			SELECT j.id
+			FROM jobs j
+			WHERE j.status = 'pending'
+			  AND j.run_at <= now()
+			  AND (
+			        j.depends_on IS NULL
+			        OR EXISTS (SELECT 1 FROM jobs d WHERE d.id = j.depends_on AND d.status = 'completed')
+			      )
+			ORDER BY `+priorityOrder+`, j.run_at ASC
+			FOR UPDATE OF j SKIP LOCKED
+			LIMIT 1
+		)
+		RETURNING id, type, queue, payload, status, attempts, max_attempts, idempotency_key, depends_on
+	`, workerName, fmt.Sprintf("%d milliseconds", visibilityTimeout.Milliseconds()))
+
+	var j Job
+	err := row.Scan(&j.ID, &j.Type, &j.Queue, &j.Payload, &j.Status, &j.Attempts, &j.MaxAttempts, &j.IdempotencyKey, &j.DependsOn)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("dequeue: %w", err)
+	}
+	return &Claim{Job: j}, nil
+}
