@@ -327,3 +327,68 @@ func (q *Queue) GetStats(ctx context.Context) (Stats, error) {
 	}
 	return s, nil
 }
+
+type DeadLetter struct {
+	ID       string          `json:"id"`
+	JobID    string          `json:"job_id"`
+	Type     string          `json:"type"`
+	Queue    string          `json:"queue"`
+	Payload  json.RawMessage `json:"payload"`
+	Attempts int             `json:"attempts"`
+	Error    string          `json:"error"`
+	FailedAt time.Time       `json:"failed_at"`
+}
+
+// Lists the most recent dead-lettered jobs, up to the specified limit. This is for
+// monitoring and debugging purposes, not for any kind of automated retry logic.
+func (q *Queue) ListDeadLetters(ctx context.Context, limit int) ([]DeadLetter, error) {
+	rows, err := q.DB.QueryContext(ctx, `
+		SELECT id, job_id, type, queue, payload, attempts, COALESCE(error,''), failed_at
+		FROM dead_letters ORDER BY failed_at DESC LIMIT $1
+	`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []DeadLetter
+	for rows.Next() {
+		var d DeadLetter
+		if err := rows.Scan(&d.ID, &d.JobID, &d.Type, &d.Queue, &d.Payload, &d.Attempts, &d.Error, &d.FailedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, nil
+}
+
+// This allows to retry a job that previously exhausted all its attempts and was moved to DLQ
+// It resets the original job to pending with a fresh attempt count
+// and removes it from the dead-letter table — it will be picked up by the exact
+// same Dequeue query as any other pending job, no special-casing needed.
+func (q *Queue) ReplayDeadLetter(ctx context.Context, deadID string) (string, error) {
+	var jobID string
+	err := q.DB.QueryRowContext(ctx, `SELECT job_id FROM dead_letters WHERE id=$1`, deadID).Scan(&jobID)
+	if err == sql.ErrNoRows {
+		return "", fmt.Errorf("dead letter not found")
+	}
+	if err != nil {
+		return "", err
+	}
+	tx, err := q.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE jobs SET status='pending', attempts=0, last_error=NULL, run_at=now(),
+		       locked_by=NULL, locked_until=NULL, updated_at=now()
+		WHERE id=$1
+	`, jobID); err != nil {
+		return "", err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM dead_letters WHERE id=$1`, deadID); err != nil {
+		return "", err
+	}
+	return jobID, tx.Commit()
+}
