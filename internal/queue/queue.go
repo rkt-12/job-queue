@@ -281,3 +281,49 @@ func (q *Queue) ReapStale(ctx context.Context) (int, error) {
 	}
 	return len(stale), nil
 }
+
+type Stats struct {
+	ByStatus map[string]int `json:"byStatus"`
+	ByQueue  map[string]int `json:"byQueue"`
+	Dead     int            `json:"deadLetterCount"`
+}
+
+// This gives three kinds of stats: how many jobs are in each status,
+// how many pending jobs are in each queue, and how many dead-lettered jobs exist.
+func (q *Queue) GetStats(ctx context.Context) (Stats, error) {
+	s := Stats{ByStatus: map[string]int{}, ByQueue: map[string]int{}}
+	rows, err := q.DB.QueryContext(ctx, `SELECT status, COUNT(*) FROM jobs GROUP BY status`)
+	if err != nil {
+		return s, err
+	}
+	for rows.Next() {
+		var status string
+		var c int
+		if err := rows.Scan(&status, &c); err != nil {
+			rows.Close()
+			return s, err
+		}
+		s.ByStatus[status] = c
+	}
+	rows.Close()
+
+	rows, err = q.DB.QueryContext(ctx, `SELECT queue, COUNT(*) FROM jobs WHERE status='pending' GROUP BY queue`)
+	if err != nil {
+		return s, err
+	}
+	for rows.Next() {
+		var qn string
+		var c int
+		if err := rows.Scan(&qn, &c); err != nil {
+			rows.Close()
+			return s, err
+		}
+		s.ByQueue[qn] = c
+	}
+	rows.Close()
+
+	if err := q.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM dead_letters`).Scan(&s.Dead); err != nil {
+		return s, err
+	}
+	return s, nil
+}
