@@ -34,16 +34,18 @@ async function refresh() {
   const dlq = await fetch('/dlq').then(r => r.json());
 
   const streamCards = document.getElementById('streamCards');
-  streamCards.innerHTML = Object.entries(stats.streams).map(([p, s]) => `
-    <div class="card">
-      <div class="label">${p} queue depth</div>
-      <div class="value">${s.depth}</div>
-      <div class="label" style="margin-top:8px">in-flight</div>
-      <div class="value">${s.inFlight}</div>
-    </div>`).join('');
+
+  const queues = stats.byQueue || {};
+
+  streamCards.innerHTML = Object.entries(queues).map(([name, depth]) => `
+  <div class="card">
+      <div class="label">${name}</div>
+      <div class="value">${depth}</div>
+  </div>
+  `).join('');
 
   const statusCards = document.getElementById('statusCards');
-  const byStatus = stats.jobs.byStatus || {};
+  const byStatus = stats.byStatus || {};
   statusCards.innerHTML = Object.entries(byStatus).map(([k, v]) => `
     <div class="card">
       <div class="label">${k}</div>
@@ -51,7 +53,7 @@ async function refresh() {
     </div>`).join('') + `
     <div class="card">
       <div class="label">dead letters</div>
-      <div class="value dead">${stats.jobs.deadLetterCount}</div>
+      <div class="value dead">${stats.deadLetterCount}</div>
     </div>`;
 
   const tbody = document.querySelector('#dlqTable tbody');
